@@ -103,7 +103,7 @@ defmodule FLAME.FlyBackend do
              :remote_terminator_pid,
              :runner_instance_id,
              :runner_private_ip,
-             :runner_node_base,
+             :runner_node_basename,
              :runner_node_name,
              :boot_timeout
            ]}
@@ -128,7 +128,7 @@ defmodule FLAME.FlyBackend do
             parent_ref: nil,
             runner_instance_id: nil,
             runner_private_ip: nil,
-            runner_node_base: nil,
+            runner_node_basename: nil,
             runner_node_name: nil,
             log: nil
 
@@ -137,7 +137,7 @@ defmodule FLAME.FlyBackend do
   @impl true
   def init(opts) do
     conf = Application.get_env(:flame, __MODULE__) || []
-    [_node_base, ip] = node() |> to_string() |> String.split("@")
+    [node_base, ip] = node() |> to_string() |> String.split("@")
 
     default = %FlyBackend{
       app: System.get_env("FLY_APP_NAME"),
