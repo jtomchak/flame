@@ -12,7 +12,6 @@ defmodule FLAME.Runner do
   #     {:ok, runner} = Runner.start_link(backend: FLAME.FlyBackend)
   #     :ok = Runner.remote_boot(runner)
   #     Runner.call(runner, fn -> :operation1 end)
-  #     Runner.cast(runner, fn -> :operation2 end)
   #     Runner.shutdown(runner)
   #
   # When a caller exits or crashes, the remote node will automatically be terminated.
@@ -23,7 +22,7 @@ defmodule FLAME.Runner do
   use GenServer
   require Logger
 
-  alias FLAME.{Runner, Terminator}
+  alias FLAME.{Runner, Terminator, CodeSync}
 
   @derive {Inspect,
            only: [
@@ -56,7 +55,9 @@ defmodule FLAME.Runner do
             boot_timeout: 10_000,
             shutdown_timeout: 5_000,
             idle_shutdown_after: nil,
-            idle_shutdown_check: nil
+            idle_shutdown_check: nil,
+            code_sync_opts: false,
+            code_sync: nil
 
   @doc """
   Starts a runner.
@@ -70,6 +71,7 @@ defmodule FLAME.Runner do
     `:boot_timeout` - The boot timeout of the runner
     `:shutdown_timeout` - The shutdown timeout
     `:idle_shutdown_after` - The idle shutdown time
+    `:code_sync` - The code sync options. See the `FLAME.Pool` module for more information.
   """
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts)
@@ -93,34 +95,38 @@ defmodule FLAME.Runner do
   to ensure that the child is not restarted if it exits. If you want restart
   behavior, you must monitor the process yourself on the parent node and replace it.
   """
-  def place_child(runner_pid, child_spec, timeout)
-      when is_pid(runner_pid) and (is_integer(timeout) or timeout in [:infinity, nil]) do
+  def place_child(runner_pid, child_spec, opts)
+      when is_pid(runner_pid) and is_list(opts) do
     # we must rewrite :temporary restart strategy for the spec to avoid restarting placed children
     new_spec = Supervisor.child_spec(child_spec, restart: :temporary)
-    caller = self()
+    caller_pid = self()
+    link? = Keyword.get(opts, :link, true)
 
     call(
       runner_pid,
+      caller_pid,
       fn terminator ->
-        Terminator.place_child(terminator, caller, new_spec)
+        Terminator.place_child(terminator, caller_pid, link?, new_spec)
       end,
-      timeout
+      opts
     )
   end
 
   @doc """
   Calls a function on the remote node.
   """
-  def call(runner_pid, func, timeout \\ nil) when is_pid(runner_pid) and is_function(func) do
+  def call(runner_pid, caller_pid, func, opts \\ [])
+      when is_pid(runner_pid) and is_pid(caller_pid) and is_function(func) and is_list(opts) do
+    link? = Keyword.get(opts, :link, true)
+    timeout = opts[:timeout] || nil
     {ref, %Runner{} = runner, backend_state} = checkout(runner_pid)
     %Runner{terminator: terminator} = runner
     call_timeout = timeout || runner.timeout
-    caller_pid = self()
 
     result =
       remote_call(runner, backend_state, call_timeout, fn ->
+        if link?, do: Process.link(caller_pid)
         :ok = Terminator.deadline_me(terminator, call_timeout)
-        Process.link(caller_pid)
         if is_function(func, 1), do: func.(terminator), else: func.()
       end)
 
@@ -138,25 +144,6 @@ defmodule FLAME.Runner do
           :throw -> throw(reason)
         end
     end
-  end
-
-  @doc """
-  Casts a function to the remote node.
-  """
-  def cast(runner_pid, func) when is_pid(runner_pid) and is_function(func, 0) do
-    {ref, runner, backend_state} = checkout(runner_pid)
-
-    %Runner{backend: backend, timeout: timeout, terminator: terminator} =
-      runner
-
-    {:ok, {_remote_pid, _remote_monitor_ref}} =
-      backend.remote_spawn_monitor(backend_state, fn ->
-        # This runs on the remote node
-        :ok = Terminator.deadline_me(terminator, timeout)
-        func.()
-      end)
-
-    :ok = checkin(runner_pid, ref)
   end
 
   defp checkout(runner_pid) do
@@ -266,6 +253,22 @@ defmodule FLAME.Runner do
 
   def handle_call(:checkout, {from_pid, _tag}, state) do
     ref = Process.monitor(from_pid)
+
+    state =
+      case maybe_diff_code_paths(state) do
+        {new_state, nil} ->
+          new_state
+
+        {new_state, %CodeSync.PackagedStream{} = parent_pkg} ->
+          remote_call!(state.runner, state.backend_state, state.runner.boot_timeout, fn ->
+            :ok = CodeSync.extract_packaged_stream(parent_pkg)
+          end)
+
+          CodeSync.rm_packaged_stream(parent_pkg)
+
+          new_state
+      end
+
     {:reply, {ref, state.runner, state.backend_state}, put_checkout(state, from_pid, ref)}
   end
 
@@ -288,6 +291,7 @@ defmodule FLAME.Runner do
               Process.monitor(remote_terminator_pid)
               new_runner = %Runner{runner | terminator: remote_terminator_pid, status: :booted}
               new_state = %{state | runner: new_runner, backend_state: new_backend_state}
+              {new_state, parent_stream} = maybe_stream_code_paths(new_state)
 
               %Runner{
                 single_use: single_use,
@@ -303,7 +307,15 @@ defmodule FLAME.Runner do
 
                   :ok =
                     Terminator.schedule_idle_shutdown(term, idle_after, idle_check, single_use)
+
+                  if parent_stream do
+                    :ok = CodeSync.extract_packaged_stream(parent_stream)
+                  else
+                    :ok
+                  end
                 end)
+
+              if parent_stream, do: CodeSync.rm_packaged_stream(parent_stream)
 
               {:reply, :ok, new_state}
 
@@ -328,8 +340,18 @@ defmodule FLAME.Runner do
         :timeout,
         :boot_timeout,
         :shutdown_timeout,
-        :idle_shutdown_after
+        :idle_shutdown_after,
+        :code_sync
       ])
+
+    Keyword.validate!(opts[:code_sync] || [], [
+      :copy_paths,
+      :sync_beams,
+      :start_apps,
+      :tmp_dir,
+      :extract_dir,
+      :verbose
+    ])
 
     {idle_shutdown_after_ms, idle_check} =
       case Keyword.fetch(opts, :idle_shutdown_after) do
@@ -351,7 +373,8 @@ defmodule FLAME.Runner do
         shutdown_timeout: opts[:shutdown_timeout] || 30_000,
         idle_shutdown_after: idle_shutdown_after_ms,
         idle_shutdown_check: idle_check,
-        terminator: nil
+        terminator: nil,
+        code_sync_opts: Keyword.get(opts, :code_sync, false)
       }
 
     {backend, backend_init} =
@@ -443,6 +466,34 @@ defmodule FLAME.Runner do
             @drain_timeout -> exit(:timeout)
           end
         end)
+    end
+  end
+
+  defp maybe_stream_code_paths(%{runner: %Runner{} = runner} = state) do
+    if code_sync_opts = runner.code_sync_opts do
+      code_sync = CodeSync.new(code_sync_opts)
+      %CodeSync.PackagedStream{} = parent_stream = CodeSync.package_to_stream(code_sync)
+      new_runner = %Runner{runner | code_sync: code_sync}
+      {%{state | runner: new_runner}, parent_stream}
+    else
+      {state, nil}
+    end
+  end
+
+  defp maybe_diff_code_paths(%{runner: %Runner{} = runner} = state) do
+    if runner.code_sync do
+      diffed_code = CodeSync.diff(runner.code_sync)
+      new_runner = %Runner{runner | code_sync: diffed_code}
+      new_state = %{state | runner: new_runner}
+
+      if CodeSync.changed?(diffed_code) do
+        %CodeSync.PackagedStream{} = parent_stream = CodeSync.package_to_stream(diffed_code)
+        {new_state, parent_stream}
+      else
+        {new_state, nil}
+      end
+    else
+      {state, nil}
     end
   end
 end
