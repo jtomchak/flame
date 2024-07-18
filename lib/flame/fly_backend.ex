@@ -137,7 +137,7 @@ defmodule FLAME.FlyBackend do
   @impl true
   def init(opts) do
     conf = Application.get_env(:flame, __MODULE__) || []
-    [node_base, ip] = node() |> to_string() |> String.split("@")
+    [_node_base, ip] = node() |> to_string() |> String.split("@")
 
     default = %FlyBackend{
       app: System.get_env("FLY_APP_NAME"),
@@ -281,32 +281,45 @@ defmodule FLAME.FlyBackend do
   def remote_boot(%FlyBackend{parent_ref: parent_ref} = state) do
     {mounts, volume_validate_time} = get_volume_id(state)
 
-    {req, req_connect_time} =
+    {resp, req_connect_time} =
       with_elapsed_ms(fn ->
-        Req.post!("#{state.host}/v1/apps/#{state.app}/machines",
-          connect_options: [timeout: state.boot_timeout],
-          retry: false,
-          auth: {:bearer, state.token},
-          headers: %{"flame-parent-ip" => "#{state.local_ip}"},
-          json: %{
-            name: "#{state.app}-flame-#{rand_id(20)}",
-            config: %{
-              image: state.image,
-              mounts: mounts,
-              guest: %{
-                cpu_kind: state.cpu_kind,
-                cpus: state.cpus,
-                memory_mb: state.memory_mb,
-                gpu_kind: state.gpu_kind
-              },
-              auto_destroy: true,
-              restart: %{policy: "no"},
-              env: state.env,
-              services: state.services
-            }
-          }
+        http_post!("#{state.host}/v1/apps/#{state.app}/machines",
+          content_type: "application/json",
+          headers: [
+            {"Content-Type", "application/json"},
+            {"Authorization", "Bearer #{state.token}"}
+          ],
+          connect_timeout: state.boot_timeout,
+          body:
+            Jason.encode!(%{
+              name: state.runner_node_base,
+              region: state.region,
+              config: %{
+                image: state.image,
+                init: state.init,
+                mounts: mounts,
+                guest: %{
+                  cpu_kind: state.cpu_kind,
+                  cpus: state.cpus,
+                  memory_mb: state.memory_mb,
+                  gpu_kind: state.gpu_kind
+                },
+                auto_destroy: true,
+                restart: %{policy: "no"},
+                env: state.env,
+                services: state.services,
+                metadata: Map.put(state.metadata, :flame_parent_ip, state.local_ip)
+              }
+            })
         )
       end)
+
+    if state.log,
+      do:
+        Logger.log(
+          state.log,
+          "#{inspect(__MODULE__)} #{inspect(node())} machine create #{req_connect_time}ms"
+        )
 
     remaining_connect_window = state.boot_timeout - req_connect_time - volume_validate_time
 
