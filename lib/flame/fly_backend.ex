@@ -103,7 +103,7 @@ defmodule FLAME.FlyBackend do
              :remote_terminator_pid,
              :runner_instance_id,
              :runner_private_ip,
-             :runner_node_basename,
+             :runner_node_base,
              :runner_node_name,
              :boot_timeout
            ]}
@@ -128,7 +128,7 @@ defmodule FLAME.FlyBackend do
             parent_ref: nil,
             runner_instance_id: nil,
             runner_private_ip: nil,
-            runner_node_basename: nil,
+            runner_node_base: nil,
             runner_node_name: nil,
             log: nil
 
@@ -149,7 +149,6 @@ defmodule FLAME.FlyBackend do
       cpus: System.schedulers_online(),
       memory_mb: 4096,
       boot_timeout: 30_000,
-      runner_node_basename: node_base,
       services: [],
       mounts: [],
       metadata: %{},
